@@ -6,6 +6,7 @@ const CURRENT_KEY = "techgajana-invoice-current";
 const HISTORY_KEY = "techgajana-invoice-history";
 const CLIENTS_KEY = "techgajana-invoice-clients";
 const SEQUENCE_KEY = "techgajana-invoice-sequence";
+const MIGRATED_KEY = "techgajana-invoice-firebase-migrated";
 
 function openAssetDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
@@ -76,6 +77,14 @@ export function loadClients(): SavedClient[] {
 
 export function saveClients(clients: SavedClient[]): void {
   window.localStorage.setItem(CLIENTS_KEY, JSON.stringify(clients));
+}
+
+export function hasMigratedLocalData(): boolean {
+  return window.localStorage.getItem(MIGRATED_KEY) === "true";
+}
+
+export function markLocalDataMigrated(): void {
+  window.localStorage.setItem(MIGRATED_KEY, "true");
 }
 
 export function getNextInvoiceNumber(): string {

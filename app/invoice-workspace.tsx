@@ -1,7 +1,8 @@
 "use client";
 
 import Image from "next/image";
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type ReactNode } from "react";
+import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from "firebase/auth";
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent, type ReactNode } from "react";
 import {
   calculateTotals,
   createDefaultInvoice,
@@ -16,9 +17,21 @@ import {
   type SavedInvoice,
   type StoredAsset,
 } from "@/lib/invoice";
+import { firebaseAuth, firebaseConfigured } from "@/lib/firebase";
+import {
+  deleteCloudInvoice,
+  loadCloudAsset,
+  migrateLocalWorkspace,
+  saveCloudClient,
+  saveCloudCurrent,
+  saveCloudInvoice,
+  uploadCloudAsset,
+  watchCloudWorkspace,
+} from "@/lib/firebase-workspace";
 import {
   advanceInvoiceSequence,
   getNextInvoiceNumber,
+  hasMigratedLocalData,
   loadAsset,
   loadClients,
   loadCurrent,
@@ -27,6 +40,7 @@ import {
   saveClients,
   saveCurrent,
   saveHistory,
+  markLocalDataMigrated,
 } from "@/lib/invoice-storage";
 
 type Area = "company" | "client" | "details" | "payment" | "bank";
@@ -102,6 +116,14 @@ export default function InvoiceWorkspace() {
   const [invoice, setInvoice] = useState<InvoiceData>(() => createDefaultInvoice("TG-INV-2026-001", "2026-01-01"));
   const [history, setHistory] = useState<SavedInvoice[]>([]);
   const [clients, setClients] = useState<SavedClient[]>([]);
+  const [user, setUser] = useState<{ uid: string; email: string | null } | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [workspaceError, setWorkspaceError] = useState("");
+  const [signInEmail, setSignInEmail] = useState("");
+  const [signInPassword, setSignInPassword] = useState("");
+  const [signInError, setSignInError] = useState("");
+  const [signInBusy, setSignInBusy] = useState(false);
   const [recordId, setRecordId] = useState<string | null>(null);
   const [assetUrls, setAssetUrls] = useState<Record<string, string>>({});
   const [toast, setToast] = useState<{ message: string; kind: "success" | "error" } | null>(null);
@@ -124,24 +146,56 @@ export default function InvoiceWorkspace() {
   }, []);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => {
-      try {
-        const saved = loadCurrent();
-        if (saved) {
-          setInvoice(saved);
-        } else {
-          setInvoice(createDefaultInvoice(getNextInvoiceNumber(), new Date().toISOString().slice(0, 10)));
-        }
-        setHistory(loadHistory());
-        setClients(loadClients());
-      } catch (error) {
-        console.error("Unable to load invoice data from this browser.", error);
-        notify("Some saved data could not be loaded. Check browser storage permissions.", "error");
-      } finally {
-        setHydrated(true);
+    if (!firebaseAuth) return;
+    let active = true;
+    let stopWorkspace = () => {};
+    const stopAuth = onAuthStateChanged(firebaseAuth, async (nextUser) => {
+      setAuthLoading(false);
+      stopWorkspace();
+      setUser(nextUser ? { uid: nextUser.uid, email: nextUser.email } : null);
+      setHydrated(false);
+      setWorkspaceError("");
+      if (!nextUser) {
+        setWorkspaceLoading(false);
+        return;
       }
-    }, 0);
-    return () => window.clearTimeout(timer);
+
+      setWorkspaceLoading(true);
+      try {
+        const shouldMigrateLocalData = !hasMigratedLocalData();
+        const cloudWorkspace = await migrateLocalWorkspace({
+          current: shouldMigrateLocalData ? loadCurrent() : null,
+          history: shouldMigrateLocalData ? loadHistory() : [],
+          clients: shouldMigrateLocalData ? loadClients() : [],
+        }, nextUser.uid);
+        if (!active || firebaseAuth?.currentUser?.uid !== nextUser.uid) return;
+        if (shouldMigrateLocalData) markLocalDataMigrated();
+        cloudWorkspace.history.forEach((saved) => advanceInvoiceSequence(saved.data.details.number));
+        setInvoice(cloudWorkspace.current ?? createDefaultInvoice(getNextInvoiceNumber(), new Date().toISOString().slice(0, 10)));
+        setHistory(cloudWorkspace.history);
+        setClients(cloudWorkspace.clients);
+        setHydrated(true);
+        stopWorkspace = watchCloudWorkspace(nextUser.uid, (workspace) => {
+          if (!active) return;
+          if (workspace.current) setInvoice(workspace.current);
+          setHistory(workspace.history);
+          setClients(workspace.clients);
+        }, (error) => {
+          console.error("Unable to sync the shared invoice workspace.", error);
+          if (active) setWorkspaceError("Live updates stopped. Check your connection and Firebase permissions.");
+        });
+      } catch (error) {
+        console.error("Unable to load the shared invoice workspace.", error);
+        if (active) setWorkspaceError("Could not load the shared workspace. Confirm your account is a workspace member and try again.");
+      } finally {
+        if (active) setWorkspaceLoading(false);
+      }
+    });
+    return () => {
+      active = false;
+      stopAuth();
+      stopWorkspace();
+    };
   }, [notify]);
 
   useEffect(() => {
@@ -153,6 +207,17 @@ export default function InvoiceWorkspace() {
       window.setTimeout(() => notify("The current invoice could not be saved. Browser storage may be full.", "error"), 0);
     }
   }, [invoice, hydrated, notify]);
+
+  useEffect(() => {
+    if (!hydrated || !user) return;
+    const timer = window.setTimeout(() => {
+      void saveCloudCurrent(user.uid, invoice).catch((error: unknown) => {
+        console.error("Unable to sync the current invoice.", error);
+        notify("The current invoice could not be synced to Firebase.", "error");
+      });
+    }, 500);
+    return () => window.clearTimeout(timer);
+  }, [invoice, hydrated, notify, user]);
 
   useEffect(() => {
     if (!hydrated) return;
@@ -191,7 +256,13 @@ export default function InvoiceWorkspace() {
     let active = true;
     void Promise.all(assetRefs.map(async (asset) => {
       if (assetUrls[asset.id]) return null;
-      const blob = await loadAsset(asset.id);
+      let blob: Blob | undefined;
+      try {
+        blob = await loadAsset(asset.id);
+      } catch {
+        blob = undefined;
+      }
+      if (!blob && user) blob = await loadCloudAsset(asset.id);
       return blob ? { id: asset.id, url: URL.createObjectURL(blob) } : null;
     })).then((loaded) => {
       if (!active) return;
@@ -207,10 +278,10 @@ export default function InvoiceWorkspace() {
       }
     }).catch((error: unknown) => {
       console.error("Unable to load one or more uploaded invoice files.", error);
-      notify("An uploaded file could not be loaded from local storage.", "error");
+      notify("An uploaded file could not be loaded from Firebase.", "error");
     });
     return () => { active = false; };
-  }, [assetKey, assetRefs, assetUrls, hydrated, notify]);
+  }, [assetKey, assetRefs, assetUrls, hydrated, notify, user]);
 
   useEffect(() => () => {
     for (const url of objectUrls.current) URL.revokeObjectURL(url);
@@ -245,6 +316,7 @@ export default function InvoiceWorkspace() {
 
     try {
       const asset = await saveAsset(file);
+      if (user) await uploadCloudAsset(asset.id, file, file.type);
       const url = URL.createObjectURL(file);
       objectUrls.current.push(url);
       setAssetUrls((current) => ({ ...current, [asset.id]: url }));
@@ -261,7 +333,7 @@ export default function InvoiceWorkspace() {
       notify(`${file.name} added to this invoice.`);
     } catch (error) {
       console.error("Unable to store uploaded file.", error);
-      notify("The file could not be stored in this browser.", "error");
+      notify("The file could not be saved to Firebase. Check your connection and storage permissions.", "error");
     }
   };
 
@@ -297,7 +369,7 @@ export default function InvoiceWorkspace() {
     return null;
   };
 
-  const saveDraft = () => {
+  const saveDraft = async () => {
     const validationError = validate();
     if (validationError) {
       notify(validationError, "error");
@@ -310,10 +382,16 @@ export default function InvoiceWorkspace() {
     }
     const id = recordId ?? newId();
     const savedInvoice: SavedInvoice = { id, savedAt: new Date().toISOString(), data: invoice };
-    setHistory((current) => [savedInvoice, ...current.filter((entry) => entry.id !== id)]);
-    setRecordId(id);
-    advanceInvoiceSequence(invoice.details.number);
-    notify("Invoice draft saved on this device.");
+    try {
+      await saveCloudInvoice(savedInvoice);
+      setHistory((current) => [savedInvoice, ...current.filter((entry) => entry.id !== id)]);
+      setRecordId(id);
+      advanceInvoiceSequence(invoice.details.number);
+      notify("Invoice draft saved to the shared workspace.");
+    } catch (error) {
+      console.error("Unable to save invoice draft to Firebase.", error);
+      notify("The invoice could not be saved to Firebase.", "error");
+    }
   };
 
   const startNewInvoice = () => {
@@ -344,25 +422,59 @@ export default function InvoiceWorkspace() {
     notify(`Loaded ${entry.data.details.number}.`);
   };
 
-  const deleteSavedInvoice = (entry: SavedInvoice) => {
+  const deleteSavedInvoice = async (entry: SavedInvoice) => {
     if (!window.confirm(`Delete saved invoice ${entry.data.details.number}? This cannot be undone.`)) return;
-    setHistory((current) => current.filter((saved) => saved.id !== entry.id));
-    if (recordId === entry.id) setRecordId(null);
-    notify("Saved invoice deleted.");
+    try {
+      await deleteCloudInvoice(entry.id);
+      setHistory((current) => current.filter((saved) => saved.id !== entry.id));
+      if (recordId === entry.id) setRecordId(null);
+      notify("Saved invoice deleted from the shared workspace.");
+    } catch (error) {
+      console.error("Unable to delete invoice from Firebase.", error);
+      notify("The invoice could not be deleted from Firebase.", "error");
+    }
   };
 
-  const saveClient = () => {
+  const saveClient = async () => {
     if (!invoice.client.name.trim()) {
       notify("Enter a client name before saving client details.", "error");
       return;
     }
+    const name = invoice.client.name.trim();
+    const existing = clients.find((saved) => saved.name.toLowerCase() === name.toLowerCase());
     const client: SavedClient = {
-      id: newId(),
-      name: invoice.client.name.trim(),
+      id: existing?.id ?? newId(),
+      name,
       details: { ...invoice.client },
     };
-    setClients((current) => [client, ...current.filter((saved) => saved.name.toLowerCase() !== client.name.toLowerCase())]);
-    notify("Client details saved for future invoices.");
+    try {
+      await saveCloudClient(client);
+      setClients((current) => [client, ...current.filter((saved) => saved.id !== client.id && saved.name.toLowerCase() !== client.name.toLowerCase())]);
+      notify("Client details saved to the shared workspace.");
+    } catch (error) {
+      console.error("Unable to save client details to Firebase.", error);
+      notify("Client details could not be saved to Firebase.", "error");
+    }
+  };
+
+  const submitSignIn = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!firebaseAuth) return;
+    setSignInError("");
+    setSignInBusy(true);
+    try {
+      await signInWithEmailAndPassword(firebaseAuth, signInEmail.trim(), signInPassword);
+    } catch (error) {
+      console.error("Unable to sign in to Firebase.", error);
+      setSignInError("Sign-in failed. Check your email, password, and Firebase account setup.");
+    } finally {
+      setSignInBusy(false);
+    }
+  };
+
+  const signOutUser = async () => {
+    if (!firebaseAuth) return;
+    await signOut(firebaseAuth);
   };
 
   const downloadInvoicePdf = async () => {
@@ -440,6 +552,66 @@ export default function InvoiceWorkspace() {
     </div>
   );
 
+  if (!firebaseConfigured) {
+    return (
+      <main className="auth-page">
+        <section className="auth-panel">
+          <div className="auth-kicker">TECHGAJANA · INVOICE STUDIO</div>
+          <h1>Firebase setup required</h1>
+          <p>Copy <code>.env.example</code> to <code>.env.local</code>, add the Firebase web app settings, then restart the development server.</p>
+        </section>
+      </main>
+    );
+  }
+
+  if (authLoading) {
+    return <main className="auth-page"><section className="auth-panel"><h1>Connecting to Firebase…</h1></section></main>;
+  }
+
+  if (!user) {
+    return (
+      <main className="auth-page">
+        <section className="auth-panel">
+          <div className="auth-kicker">TECHGAJANA · INVOICE STUDIO</div>
+          <h1>Sign in</h1>
+          <p>Use your company workspace account to access shared invoices and clients.</p>
+          <form className="auth-form" onSubmit={(event) => void submitSignIn(event)}>
+            <label className="auth-field">
+              <span>Email</span>
+              <input className="input-control" type="email" autoComplete="username" value={signInEmail} onChange={(event) => setSignInEmail(event.target.value)} required />
+            </label>
+            <label className="auth-field">
+              <span>Password</span>
+              <input className="input-control" type="password" autoComplete="current-password" value={signInPassword} onChange={(event) => setSignInPassword(event.target.value)} required />
+            </label>
+            {signInError && <p className="auth-error" role="alert">{signInError}</p>}
+            <button className="button button-primary auth-submit" type="submit" disabled={signInBusy}>
+              {signInBusy ? "Signing in…" : "Sign in to workspace"}
+            </button>
+          </form>
+          <p className="auth-footnote">Workspace accounts are provisioned by an administrator.</p>
+        </section>
+      </main>
+    );
+  }
+
+  if (workspaceLoading) {
+    return <main className="auth-page"><section className="auth-panel"><h1>Loading shared workspace…</h1></section></main>;
+  }
+
+  if (workspaceError && !hydrated) {
+    return (
+      <main className="auth-page">
+        <section className="auth-panel">
+          <div className="auth-kicker">WORKSPACE UNAVAILABLE</div>
+          <h1>Could not connect</h1>
+          <p>{workspaceError}</p>
+          <button type="button" className="button button-outline" onClick={() => void signOutUser()}>Sign out</button>
+        </section>
+      </main>
+    );
+  }
+
   return (
     <main className="workspace">
       <header className="topbar">
@@ -455,8 +627,12 @@ export default function InvoiceWorkspace() {
           <span className="brand-name">Invoice Studio</span>
         </a>
         <div className="topbar-spacer" />
-        <div className="local-badge"><span /> Saved on this device</div>
+        <div className="local-badge"><span /> Shared cloud workspace</div>
+        <span className="cloud-user">{user.email}</span>
+        <button type="button" className="button button-outline" onClick={() => void signOutUser()}>Sign out</button>
       </header>
+
+      {workspaceError && <div className="cloud-warning" role="alert">{workspaceError}</div>}
 
       <section className="page-heading">
         <h1>Create invoice</h1>
@@ -485,7 +661,7 @@ export default function InvoiceWorkspace() {
       {showHistory && (
         <aside className="history-panel">
           <div className="history-heading">
-            <div><strong>Saved invoices</strong><span>Your drafts stay on this device.</span></div>
+            <div><strong>Saved invoices</strong><span>Shared with your workspace.</span></div>
             <button type="button" className="icon-button" onClick={() => setShowHistory(false)} aria-label="Close invoice history"><Icon name="close" /></button>
           </div>
           {history.length === 0 ? (
