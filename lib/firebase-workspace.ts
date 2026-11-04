@@ -7,14 +7,17 @@ import {
   onSnapshot,
   orderBy,
   query,
+  runTransaction,
   setDoc,
 } from "firebase/firestore";
-import { getBlob, ref, uploadBytes } from "firebase/storage";
-import type { InvoiceData, SavedClient, SavedInvoice, StoredAsset } from "./invoice";
-import { firestore, firebaseStorage } from "./firebase";
-import { loadAsset } from "./invoice-storage";
+import { createDefaultInvoice } from "./invoice";
+import type { InvoiceData, PaymentDetails, SavedClient, SavedInvoice } from "./invoice";
+import { firestore } from "./firebase";
 
 const WORKSPACE_ID = "techgajana";
+const CURRENT_DRAFT_ID = "current";
+const CURRENT_INVOICE_ID = "current";
+const INVOICE_COUNTER_PREFIX = "invoice-";
 
 export interface CloudWorkspace {
   current: InvoiceData | null;
@@ -27,13 +30,13 @@ function requireFirestore() {
   return firestore;
 }
 
-function requireStorage() {
-  if (!firebaseStorage) throw new Error("Firebase is not configured.");
-  return firebaseStorage;
-}
-
 function workspaceCollection(name: "invoices" | "clients") {
   return collection(requireFirestore(), "workspaces", WORKSPACE_ID, name);
+}
+
+function invoiceSequence(invoiceNumber: string, year: number): number {
+  const match = invoiceNumber.match(/^TG-INV-(\d{4})-(\d+)$/);
+  return match && Number(match[1]) === year ? Number(match[2]) : 0;
 }
 
 function withoutUndefined<T>(value: T): T {
@@ -48,38 +51,67 @@ function withoutUndefined<T>(value: T): T {
   return value;
 }
 
-function assetReferences(invoice: InvoiceData): StoredAsset[] {
-  return [
-    invoice.company.logo,
-    invoice.company.signature,
-    invoice.company.stamp,
-    invoice.bank.qrCode,
-    ...invoice.payment.proofs,
-  ].filter((asset): asset is StoredAsset => Boolean(asset));
+function parseInvoice(value: unknown): InvoiceData | null {
+  if (!value || typeof value !== "object") return null;
+  const document = value as Record<string, unknown>;
+  const raw = (document.data && typeof document.data === "object" ? document.data : document) as Partial<InvoiceData>;
+  const date = typeof raw.details?.date === "string" ? raw.details.date : new Date().toISOString().slice(0, 10);
+  const defaults = createDefaultInvoice(typeof raw.details?.number === "string" ? raw.details.number : "", date);
+  const rawPayment = raw.payment as Partial<PaymentDetails> | undefined;
+  const payments = Array.isArray(rawPayment?.payments)
+    ? rawPayment.payments
+    : rawPayment && typeof rawPayment.advance === "number"
+      ? [{ id: "advance-payment", label: "Advance", amount: rawPayment.advance, date: rawPayment.date ?? date }]
+      : defaults.payment.payments ?? [];
+
+  return {
+    ...defaults,
+    ...raw,
+    company: { ...defaults.company, ...raw.company },
+    client: { ...defaults.client, ...raw.client },
+    details: { ...defaults.details, ...raw.details },
+    items: Array.isArray(raw.items) ? raw.items : defaults.items,
+    payment: { ...defaults.payment, ...rawPayment, payments },
+    bank: { ...defaults.bank, ...raw.bank },
+    terms: Array.isArray(raw.terms) ? raw.terms : defaults.terms,
+  };
 }
 
-export async function getCloudWorkspace(userId: string): Promise<CloudWorkspace> {
+export async function getCloudWorkspace(): Promise<CloudWorkspace> {
   const database = requireFirestore();
-  const [currentSnapshot, invoiceSnapshot, clientSnapshot] = await Promise.all([
-    getDoc(doc(database, "workspaces", WORKSPACE_ID, "drafts", userId)),
+  const draftRef = doc(database, "workspaces", WORKSPACE_ID, "drafts", CURRENT_DRAFT_ID);
+  const invoiceRef = doc(database, "workspaces", WORKSPACE_ID, "invoice", CURRENT_INVOICE_ID);
+  const [currentSnapshot, invoiceSnapshot, savedInvoiceSnapshot, clientSnapshot] = await Promise.all([
+    getDoc(draftRef),
+    getDoc(invoiceRef),
     getDocs(query(workspaceCollection("invoices"), orderBy("savedAt", "desc"))),
     getDocs(query(workspaceCollection("clients"), orderBy("name"))),
   ]);
 
+  let current = parseInvoice(currentSnapshot.exists() ? currentSnapshot.data() : null);
+  if (!current && invoiceSnapshot.exists()) {
+    current = parseInvoice(invoiceSnapshot.data());
+    if (current) {
+      await setDoc(draftRef, { data: withoutUndefined(current) });
+      await deleteDoc(invoiceRef);
+    }
+  }
+
   return {
-    current: currentSnapshot.exists() ? currentSnapshot.data().data as InvoiceData : null,
-    history: invoiceSnapshot.docs.map((entry) => entry.data() as SavedInvoice),
+    current,
+    history: savedInvoiceSnapshot.docs.map((entry) => entry.data() as SavedInvoice),
     clients: clientSnapshot.docs.map((entry) => entry.data() as SavedClient),
   };
 }
 
-export async function migrateLocalWorkspace(local: CloudWorkspace, userId: string): Promise<CloudWorkspace> {
-  const cloud = await getCloudWorkspace(userId);
+export async function migrateLocalWorkspace(local: CloudWorkspace): Promise<CloudWorkspace> {
+  const cloud = await getCloudWorkspace();
   const knownInvoices = new Set(cloud.history.map((entry) => entry.id));
   const knownClients = new Set(cloud.clients.map((entry) => entry.id));
   const pendingWrites: Promise<void>[] = [];
+  const shouldMigrateCurrent = !cloud.current && Boolean(local.current);
 
-  if (!cloud.current && local.current) pendingWrites.push(saveCloudCurrent(userId, local.current));
+  if (shouldMigrateCurrent && local.current) pendingWrites.push(saveCloudCurrent(local.current));
   for (const invoice of local.history) {
     if (!knownInvoices.has(invoice.id)) pendingWrites.push(saveCloudInvoice(invoice));
   }
@@ -87,20 +119,28 @@ export async function migrateLocalWorkspace(local: CloudWorkspace, userId: strin
     if (!knownClients.has(client.id)) pendingWrites.push(saveCloudClient(client));
   }
 
-  const assetRefs = [
-    ...(local.current ? assetReferences(local.current) : []),
-    ...local.history.flatMap((invoice) => assetReferences(invoice.data)),
-  ];
-  await Promise.all([...new Map(assetRefs.map((asset) => [asset.id, asset])).values()].map(async (asset) => {
-    const blob = await loadAsset(asset.id);
-    if (blob) await uploadCloudAsset(asset.id, blob, asset.type);
-  }));
   await Promise.all(pendingWrites);
-  return getCloudWorkspace(userId);
+  return getCloudWorkspace();
+}
+
+export async function reserveNextInvoiceNumber(existingInvoiceNumbers: string[]): Promise<string> {
+  const year = new Date().getFullYear();
+  const counterRef = doc(requireFirestore(), "workspaces", WORKSPACE_ID, "counters", `${INVOICE_COUNTER_PREFIX}${year}`);
+  const highestExistingSequence = existingInvoiceNumbers.reduce(
+    (highest, number) => Math.max(highest, invoiceSequence(number, year)),
+    0,
+  );
+  const nextSequence = await runTransaction(requireFirestore(), async (transaction) => {
+    const snapshot = await transaction.get(counterRef);
+    const lastSequence = typeof snapshot.data()?.lastSequence === "number" ? snapshot.data()?.lastSequence as number : 0;
+    const next = Math.max(lastSequence, highestExistingSequence) + 1;
+    transaction.set(counterRef, { lastSequence: next });
+    return next;
+  });
+  return `TG-INV-${year}-${String(nextSequence).padStart(3, "0")}`;
 }
 
 export function watchCloudWorkspace(
-  userId: string,
   onChange: (workspace: CloudWorkspace) => void,
   onError: (error: Error) => void,
 ): () => void {
@@ -112,7 +152,7 @@ export function watchCloudWorkspace(
   };
 
   const stopCurrent = onSnapshot(
-    doc(database, "workspaces", WORKSPACE_ID, "drafts", userId),
+    doc(database, "workspaces", WORKSPACE_ID, "drafts", CURRENT_DRAFT_ID),
     (snapshot) => {
       state.current = snapshot.exists() ? snapshot.data().data as InvoiceData : null;
       loaded.current = true;
@@ -146,8 +186,8 @@ export function watchCloudWorkspace(
   };
 }
 
-export async function saveCloudCurrent(userId: string, invoice: InvoiceData): Promise<void> {
-  await setDoc(doc(requireFirestore(), "workspaces", WORKSPACE_ID, "drafts", userId), { data: withoutUndefined(invoice) });
+export async function saveCloudCurrent(invoice: InvoiceData): Promise<void> {
+  await setDoc(doc(requireFirestore(), "workspaces", WORKSPACE_ID, "drafts", CURRENT_DRAFT_ID), { data: withoutUndefined(invoice) });
 }
 
 export async function saveCloudInvoice(invoice: SavedInvoice): Promise<void> {
@@ -160,12 +200,4 @@ export async function deleteCloudInvoice(id: string): Promise<void> {
 
 export async function saveCloudClient(client: SavedClient): Promise<void> {
   await setDoc(doc(workspaceCollection("clients"), client.id), withoutUndefined(client));
-}
-
-export async function uploadCloudAsset(id: string, file: Blob, contentType: string): Promise<void> {
-  await uploadBytes(ref(requireStorage(), `assets/${id}`), file, { contentType });
-}
-
-export async function loadCloudAsset(id: string): Promise<Blob> {
-  return getBlob(ref(requireStorage(), `assets/${id}`));
 }

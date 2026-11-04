@@ -1,50 +1,40 @@
 "use client";
 
 import Image from "next/image";
-import { onAuthStateChanged, signInWithEmailAndPassword, signOut } from "firebase/auth";
-import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
+  COMPANY_IDENTITY,
   calculateTotals,
   createDefaultInvoice,
   formatCurrency,
+  getPaymentEntries,
   itemAmounts,
   newId,
-  type BankDetails,
-  type CompanyDetails,
+  normalizeInvoiceTerms,
   type InvoiceData,
   type InvoiceItem,
+  type PaymentEntry,
   type SavedClient,
   type SavedInvoice,
-  type StoredAsset,
 } from "@/lib/invoice";
-import { firebaseAuth, firebaseConfigured } from "@/lib/firebase";
 import {
   deleteCloudInvoice,
-  loadCloudAsset,
   migrateLocalWorkspace,
+  reserveNextInvoiceNumber,
   saveCloudClient,
   saveCloudCurrent,
   saveCloudInvoice,
-  uploadCloudAsset,
   watchCloudWorkspace,
 } from "@/lib/firebase-workspace";
 import {
-  advanceInvoiceSequence,
-  getNextInvoiceNumber,
   hasMigratedLocalData,
-  loadAsset,
-  loadClients,
-  loadCurrent,
-  loadHistory,
-  saveAsset,
-  saveClients,
-  saveCurrent,
-  saveHistory,
-  markLocalDataMigrated,
+  loadLegacyLocalWorkspace,
+  markLegacyLocalDataMigrated,
 } from "@/lib/invoice-storage";
+import { firebaseConfigured } from "@/lib/firebase";
 
-type Area = "company" | "client" | "details" | "payment" | "bank";
-type AssetTarget = "logo" | "signature" | "stamp" | "qr" | "proof";
+type Area = "client" | "details" | "payment";
+const FIRESTORE_UNAVAILABLE_MESSAGE = "Unable to connect to Firestore. Check Firebase configuration, network access, and Firestore rules, then retry. Invoice data is not being saved in this browser.";
 
 const iconPaths: Record<string, ReactNode> = {
   add: <><path d="M12 5v14M5 12h14" /></>,
@@ -112,33 +102,27 @@ function SelectInput(props: React.SelectHTMLAttributes<HTMLSelectElement>) {
   return <select {...props} className={`input-control select-control ${props.className ?? ""}`} />;
 }
 
+function CompanyLogo({ className }: { className: string }) {
+  return (
+    <Image src="/techgajana-mark.png" alt="Tech Gajana logo" width={470} height={370} className={className} priority unoptimized />
+  );
+}
+
 export default function InvoiceWorkspace() {
   const [invoice, setInvoice] = useState<InvoiceData>(() => createDefaultInvoice("TG-INV-2026-001", "2026-01-01"));
   const [history, setHistory] = useState<SavedInvoice[]>([]);
   const [clients, setClients] = useState<SavedClient[]>([]);
-  const [user, setUser] = useState<{ uid: string; email: string | null } | null>(null);
-  const [authLoading, setAuthLoading] = useState(true);
-  const [workspaceLoading, setWorkspaceLoading] = useState(false);
+  const [workspaceLoading, setWorkspaceLoading] = useState(true);
   const [workspaceError, setWorkspaceError] = useState("");
-  const [signInEmail, setSignInEmail] = useState("");
-  const [signInPassword, setSignInPassword] = useState("");
-  const [signInError, setSignInError] = useState("");
-  const [signInBusy, setSignInBusy] = useState(false);
+  const [cloudAvailable, setCloudAvailable] = useState(false);
   const [recordId, setRecordId] = useState<string | null>(null);
-  const [assetUrls, setAssetUrls] = useState<Record<string, string>>({});
   const [toast, setToast] = useState<{ message: string; kind: "success" | "error" } | null>(null);
   const [showHistory, setShowHistory] = useState(false);
   const [hydrated, setHydrated] = useState(false);
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
-  const fileInputs = useRef<Record<AssetTarget, HTMLInputElement | null>>({
-    logo: null,
-    signature: null,
-    stamp: null,
-    qr: null,
-    proof: null,
-  });
-  const objectUrls = useRef<string[]>([]);
   const totals = useMemo(() => calculateTotals(invoice), [invoice]);
+  const paymentEntries = useMemo(() => getPaymentEntries(invoice.payment), [invoice.payment]);
+  const invoiceTerms = useMemo(() => normalizeInvoiceTerms(invoice.terms), [invoice.terms]);
 
   const notify = useCallback((message: string, kind: "success" | "error" = "success") => {
     setToast({ message, kind });
@@ -146,146 +130,74 @@ export default function InvoiceWorkspace() {
   }, []);
 
   useEffect(() => {
-    if (!firebaseAuth) return;
     let active = true;
     let stopWorkspace = () => {};
-    const stopAuth = onAuthStateChanged(firebaseAuth, async (nextUser) => {
-      setAuthLoading(false);
-      stopWorkspace();
-      setUser(nextUser ? { uid: nextUser.uid, email: nextUser.email } : null);
-      setHydrated(false);
-      setWorkspaceError("");
-      if (!nextUser) {
-        setWorkspaceLoading(false);
-        return;
-      }
-
-      setWorkspaceLoading(true);
+    const loadWorkspace = async () => {
       try {
         const shouldMigrateLocalData = !hasMigratedLocalData();
+        const legacyWorkspace = shouldMigrateLocalData
+          ? loadLegacyLocalWorkspace()
+          : { current: null, history: [], clients: [] };
         const cloudWorkspace = await migrateLocalWorkspace({
-          current: shouldMigrateLocalData ? loadCurrent() : null,
-          history: shouldMigrateLocalData ? loadHistory() : [],
-          clients: shouldMigrateLocalData ? loadClients() : [],
-        }, nextUser.uid);
-        if (!active || firebaseAuth?.currentUser?.uid !== nextUser.uid) return;
-        if (shouldMigrateLocalData) markLocalDataMigrated();
-        cloudWorkspace.history.forEach((saved) => advanceInvoiceSequence(saved.data.details.number));
-        setInvoice(cloudWorkspace.current ?? createDefaultInvoice(getNextInvoiceNumber(), new Date().toISOString().slice(0, 10)));
+          current: legacyWorkspace.current,
+          history: legacyWorkspace.history,
+          clients: legacyWorkspace.clients,
+        });
+        if (!active) return;
+        if (shouldMigrateLocalData) markLegacyLocalDataMigrated();
+        setCloudAvailable(true);
+        setWorkspaceError("");
+        const defaultNumber = cloudWorkspace.current
+          ? cloudWorkspace.current.details.number
+          : await reserveNextInvoiceNumber([
+            ...cloudWorkspace.history.map((saved) => saved.data.details.number),
+          ]);
+        if (!active) return;
+        setInvoice(cloudWorkspace.current ?? createDefaultInvoice(defaultNumber, new Date().toISOString().slice(0, 10)));
         setHistory(cloudWorkspace.history);
         setClients(cloudWorkspace.clients);
         setHydrated(true);
-        stopWorkspace = watchCloudWorkspace(nextUser.uid, (workspace) => {
+        stopWorkspace = watchCloudWorkspace((workspace) => {
           if (!active) return;
           if (workspace.current) setInvoice(workspace.current);
           setHistory(workspace.history);
           setClients(workspace.clients);
         }, (error) => {
           console.error("Unable to sync the shared invoice workspace.", error);
-          if (active) setWorkspaceError("Live updates stopped. Check your connection and Firebase permissions.");
+          if (active) {
+            setCloudAvailable(false);
+            setWorkspaceError(FIRESTORE_UNAVAILABLE_MESSAGE);
+          }
         });
       } catch (error) {
         console.error("Unable to load the shared invoice workspace.", error);
-        if (active) setWorkspaceError("Could not load the shared workspace. Confirm your account is a workspace member and try again.");
+        if (active) {
+          setCloudAvailable(false);
+          setWorkspaceError(error instanceof Error ? error.message : FIRESTORE_UNAVAILABLE_MESSAGE);
+        }
       } finally {
         if (active) setWorkspaceLoading(false);
       }
-    });
+    };
+    void loadWorkspace();
     return () => {
       active = false;
-      stopAuth();
       stopWorkspace();
     };
-  }, [notify]);
+  }, []);
 
   useEffect(() => {
-    if (!hydrated) return;
-    try {
-      saveCurrent(invoice);
-    } catch (error) {
-      console.error("Unable to save the current invoice.", error);
-      window.setTimeout(() => notify("The current invoice could not be saved. Browser storage may be full.", "error"), 0);
-    }
-  }, [invoice, hydrated, notify]);
-
-  useEffect(() => {
-    if (!hydrated || !user) return;
+    if (!hydrated || !cloudAvailable) return;
     const timer = window.setTimeout(() => {
-      void saveCloudCurrent(user.uid, invoice).catch((error: unknown) => {
+      void saveCloudCurrent(invoice).catch((error: unknown) => {
         console.error("Unable to sync the current invoice.", error);
-        notify("The current invoice could not be synced to Firebase.", "error");
+        setCloudAvailable(false);
+        setWorkspaceError(FIRESTORE_UNAVAILABLE_MESSAGE);
+        notify("The current invoice could not be saved to Firestore.", "error");
       });
     }, 500);
     return () => window.clearTimeout(timer);
-  }, [invoice, hydrated, notify, user]);
-
-  useEffect(() => {
-    if (!hydrated) return;
-    try {
-      saveHistory(history);
-    } catch (error) {
-      console.error("Unable to save invoice history.", error);
-      window.setTimeout(() => notify("Invoice history could not be saved. Browser storage may be full.", "error"), 0);
-    }
-  }, [history, hydrated, notify]);
-
-  useEffect(() => {
-    if (!hydrated) return;
-    try {
-      saveClients(clients);
-    } catch (error) {
-      console.error("Unable to save client details.", error);
-      window.setTimeout(() => notify("Client details could not be saved.", "error"), 0);
-    }
-  }, [clients, hydrated, notify]);
-
-  const assetRefs = useMemo(() => {
-    const refs = [
-      invoice.company.logo,
-      invoice.company.signature,
-      invoice.company.stamp,
-      invoice.bank.qrCode,
-      ...invoice.payment.proofs,
-    ].filter((asset): asset is StoredAsset => Boolean(asset));
-    return [...new Map(refs.map((ref) => [ref.id, ref])).values()];
-  }, [invoice]);
-  const assetKey = assetRefs.map((asset) => asset.id).join("|");
-
-  useEffect(() => {
-    if (!hydrated || assetRefs.length === 0) return;
-    let active = true;
-    void Promise.all(assetRefs.map(async (asset) => {
-      if (assetUrls[asset.id]) return null;
-      let blob: Blob | undefined;
-      try {
-        blob = await loadAsset(asset.id);
-      } catch {
-        blob = undefined;
-      }
-      if (!blob && user) blob = await loadCloudAsset(asset.id);
-      return blob ? { id: asset.id, url: URL.createObjectURL(blob) } : null;
-    })).then((loaded) => {
-      if (!active) return;
-      const additions: Record<string, string> = {};
-      for (const asset of loaded) {
-        if (asset) {
-          additions[asset.id] = asset.url;
-          objectUrls.current.push(asset.url);
-        }
-      }
-      if (Object.keys(additions).length > 0) {
-        setAssetUrls((current) => ({ ...current, ...additions }));
-      }
-    }).catch((error: unknown) => {
-      console.error("Unable to load one or more uploaded invoice files.", error);
-      notify("An uploaded file could not be loaded from Firebase.", "error");
-    });
-    return () => { active = false; };
-  }, [assetKey, assetRefs, assetUrls, hydrated, notify, user]);
-
-  useEffect(() => () => {
-    for (const url of objectUrls.current) URL.revokeObjectURL(url);
-  }, []);
+  }, [invoice, hydrated, cloudAvailable, notify]);
 
   const updateArea = <K extends Area>(area: K, changes: Partial<InvoiceData[K]>) => {
     setInvoice((current) => ({
@@ -301,70 +213,71 @@ export default function InvoiceWorkspace() {
     }));
   };
 
-  const handleUpload = async (target: AssetTarget, event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    event.target.value = "";
-    if (!file) return;
-    const isProof = target === "proof";
-    const allowed = isProof
-      ? ["image/png", "image/jpeg", "image/webp", "application/pdf"]
-      : ["image/png", "image/jpeg", "image/webp"];
-    if (!allowed.includes(file.type)) {
-      notify(isProof ? "Choose a PNG, JPG, WebP, or PDF file." : "Choose a PNG, JPG, or WebP image.", "error");
-      return;
-    }
-
-    try {
-      const asset = await saveAsset(file);
-      if (user) await uploadCloudAsset(asset.id, file, file.type);
-      const url = URL.createObjectURL(file);
-      objectUrls.current.push(url);
-      setAssetUrls((current) => ({ ...current, [asset.id]: url }));
-      if (target === "logo" || target === "signature" || target === "stamp") {
-        updateArea("company", { [target]: asset } as Partial<CompanyDetails>);
-      } else if (target === "qr") {
-        updateArea("bank", { qrCode: asset } as Partial<BankDetails>);
-      } else {
-        setInvoice((current) => ({
-          ...current,
-          payment: { ...current.payment, proofs: [...current.payment.proofs, asset] },
-        }));
-      }
-      notify(`${file.name} added to this invoice.`);
-    } catch (error) {
-      console.error("Unable to store uploaded file.", error);
-      notify("The file could not be saved to Firebase. Check your connection and storage permissions.", "error");
-    }
-  };
-
-  const removeAsset = (target: AssetTarget, assetId?: string) => {
-    if (target === "logo" || target === "signature" || target === "stamp") {
-      updateArea("company", { [target]: undefined } as Partial<CompanyDetails>);
-    } else if (target === "qr") {
-      updateArea("bank", { qrCode: undefined } as Partial<BankDetails>);
-    } else {
-      setInvoice((current) => ({
+  const updatePayment = (id: string, changes: Partial<PaymentEntry>) => {
+    setInvoice((current) => {
+      const payments = getPaymentEntries(current.payment).map((payment) => (
+        payment.id === id ? { ...payment, ...changes } : payment
+      ));
+      return {
         ...current,
         payment: {
           ...current.payment,
-          proofs: current.payment.proofs.filter((proof) => proof.id !== assetId),
+          payments,
+          advance: payments[0]?.amount ?? 0,
+          date: payments[0]?.date ?? "",
         },
-      }));
-    }
+      };
+    });
+  };
+
+  const addPayment = () => {
+    setInvoice((current) => {
+      const payments = getPaymentEntries(current.payment);
+      return {
+        ...current,
+        payment: {
+          ...current.payment,
+          payments: [...payments, {
+            id: newId(),
+            label: `Payment ${payments.length + 1}`,
+            amount: 0,
+            date: "",
+          }],
+        },
+      };
+    });
+  };
+
+  const removePayment = (id: string) => {
+    setInvoice((current) => {
+      const payments = getPaymentEntries(current.payment).filter((payment) => payment.id !== id);
+      return {
+        ...current,
+        payment: {
+          ...current.payment,
+          payments,
+          advance: payments[0]?.amount ?? 0,
+          date: payments[0]?.date ?? "",
+        },
+      };
+    });
   };
 
   const validate = (forPrint = false): string | null => {
     if (!invoice.details.number.trim()) return "Enter an invoice number.";
     if (invoice.items.length === 0) return "Add at least one service or item.";
     if (forPrint && !invoice.client.name.trim()) return "Add the client or company name before printing.";
+    const payments = getPaymentEntries(invoice.payment);
+    if (payments.some((payment) => payment.amount < 0)) return "Payment amounts cannot be negative.";
+    if (payments.some((payment) => payment.amount > 0 && !payment.date)) return "Enter a date for each recorded payment.";
     for (const item of invoice.items) {
       if (item.quantity < 0 || item.rate < 0 || item.discount < 0 || item.taxPercent < 0) {
         return "Quantities, rates, discounts, and tax rates cannot be negative.";
       }
       if (forPrint && !item.description.trim()) return "Add a description to every invoice item.";
     }
-    if (invoice.payment.advance < 0 || invoice.additionalCharges < 0) {
-      return "Advance payments and additional charges cannot be negative.";
+    if (invoice.additionalCharges < 0) {
+      return "Additional charges cannot be negative.";
     }
     return null;
   };
@@ -380,39 +293,61 @@ export default function InvoiceWorkspace() {
       notify("That invoice number is already saved. Use a unique number to avoid duplicates.", "error");
       return;
     }
+    if (!cloudAvailable) {
+      notify(FIRESTORE_UNAVAILABLE_MESSAGE, "error");
+      return;
+    }
     const id = recordId ?? newId();
     const savedInvoice: SavedInvoice = { id, savedAt: new Date().toISOString(), data: invoice };
     try {
       await saveCloudInvoice(savedInvoice);
-      setHistory((current) => [savedInvoice, ...current.filter((entry) => entry.id !== id)]);
-      setRecordId(id);
-      advanceInvoiceSequence(invoice.details.number);
-      notify("Invoice draft saved to the shared workspace.");
     } catch (error) {
-      console.error("Unable to save invoice draft to Firebase.", error);
-      notify("The invoice could not be saved to Firebase.", "error");
+      console.error("Unable to save invoice draft to Firestore.", error);
+      setCloudAvailable(false);
+      setWorkspaceError(FIRESTORE_UNAVAILABLE_MESSAGE);
+      notify("Invoice draft could not be saved to Firestore.", "error");
+      return;
+    }
+    setHistory((current) => [savedInvoice, ...current.filter((entry) => entry.id !== id)]);
+    setRecordId(id);
+    notify("Invoice draft saved to Firestore.");
+  };
+
+  const startNewInvoice = async () => {
+    if (!window.confirm("Start a new invoice? Unsaved client, item, and payment edits will be replaced.")) return;
+    try {
+      const number = await reserveNextInvoiceNumber([
+        invoice.details.number,
+        ...history.map((saved) => saved.data.details.number),
+      ]);
+      const fresh = createDefaultInvoice(number, new Date().toISOString().slice(0, 10));
+      fresh.terms = [...invoice.terms];
+      setInvoice(fresh);
+      setRecordId(null);
+      setShowHistory(false);
+    } catch (error) {
+      console.error("Unable to reserve a new invoice number from Firestore.", error);
+      notify("A new invoice number could not be reserved. Check your Firestore connection.", "error");
     }
   };
 
-  const startNewInvoice = () => {
-    if (!window.confirm("Start a new invoice? Unsaved client, item, and payment edits will be replaced.")) return;
-    const fresh = createDefaultInvoice(getNextInvoiceNumber(), new Date().toISOString().slice(0, 10));
-    fresh.company = invoice.company;
-    fresh.bank = invoice.bank;
-    fresh.terms = [...invoice.terms];
-    setInvoice(fresh);
-    setRecordId(null);
-    setShowHistory(false);
-  };
-
-  const duplicateInvoice = () => {
-    const copy = structuredClone(invoice);
-    copy.details.number = getNextInvoiceNumber();
-    copy.details.date = new Date().toISOString().slice(0, 10);
-    setInvoice(copy);
-    setRecordId(null);
-    setShowHistory(false);
-    notify("Invoice duplicated with a new invoice number.");
+  const duplicateInvoice = async () => {
+    try {
+      const number = await reserveNextInvoiceNumber([
+        invoice.details.number,
+        ...history.map((saved) => saved.data.details.number),
+      ]);
+      const copy = structuredClone(invoice);
+      copy.details.number = number;
+      copy.details.date = new Date().toISOString().slice(0, 10);
+      setInvoice(copy);
+      setRecordId(null);
+      setShowHistory(false);
+      notify("Invoice duplicated with a new invoice number.");
+    } catch (error) {
+      console.error("Unable to reserve an invoice number for duplication.", error);
+      notify("Invoice could not be duplicated because a new number was not reserved.", "error");
+    }
   };
 
   const loadSavedInvoice = (entry: SavedInvoice) => {
@@ -424,15 +359,22 @@ export default function InvoiceWorkspace() {
 
   const deleteSavedInvoice = async (entry: SavedInvoice) => {
     if (!window.confirm(`Delete saved invoice ${entry.data.details.number}? This cannot be undone.`)) return;
+    if (!cloudAvailable) {
+      notify(FIRESTORE_UNAVAILABLE_MESSAGE, "error");
+      return;
+    }
     try {
       await deleteCloudInvoice(entry.id);
-      setHistory((current) => current.filter((saved) => saved.id !== entry.id));
-      if (recordId === entry.id) setRecordId(null);
-      notify("Saved invoice deleted from the shared workspace.");
     } catch (error) {
-      console.error("Unable to delete invoice from Firebase.", error);
-      notify("The invoice could not be deleted from Firebase.", "error");
+      console.error("Unable to delete invoice from Firestore.", error);
+      setCloudAvailable(false);
+      setWorkspaceError(FIRESTORE_UNAVAILABLE_MESSAGE);
+      notify("Saved invoice could not be deleted from Firestore.", "error");
+      return;
     }
+    setHistory((current) => current.filter((saved) => saved.id !== entry.id));
+    if (recordId === entry.id) setRecordId(null);
+    notify("Saved invoice deleted from Firestore.");
   };
 
   const saveClient = async () => {
@@ -447,34 +389,21 @@ export default function InvoiceWorkspace() {
       name,
       details: { ...invoice.client },
     };
+    if (!cloudAvailable) {
+      notify(FIRESTORE_UNAVAILABLE_MESSAGE, "error");
+      return;
+    }
     try {
       await saveCloudClient(client);
-      setClients((current) => [client, ...current.filter((saved) => saved.id !== client.id && saved.name.toLowerCase() !== client.name.toLowerCase())]);
-      notify("Client details saved to the shared workspace.");
     } catch (error) {
-      console.error("Unable to save client details to Firebase.", error);
-      notify("Client details could not be saved to Firebase.", "error");
+      console.error("Unable to save client details to Firestore.", error);
+      setCloudAvailable(false);
+      setWorkspaceError(FIRESTORE_UNAVAILABLE_MESSAGE);
+      notify("Client details could not be saved to Firestore.", "error");
+      return;
     }
-  };
-
-  const submitSignIn = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!firebaseAuth) return;
-    setSignInError("");
-    setSignInBusy(true);
-    try {
-      await signInWithEmailAndPassword(firebaseAuth, signInEmail.trim(), signInPassword);
-    } catch (error) {
-      console.error("Unable to sign in to Firebase.", error);
-      setSignInError("Sign-in failed. Check your email, password, and Firebase account setup.");
-    } finally {
-      setSignInBusy(false);
-    }
-  };
-
-  const signOutUser = async () => {
-    if (!firebaseAuth) return;
-    await signOut(firebaseAuth);
+    setClients((current) => [client, ...current.filter((saved) => saved.id !== client.id && saved.name.toLowerCase() !== client.name.toLowerCase())]);
+    notify("Client details saved to Firestore.");
   };
 
   const downloadInvoicePdf = async () => {
@@ -483,9 +412,36 @@ export default function InvoiceWorkspace() {
       notify(validationError, "error");
       return;
     }
+    const duplicate = history.find((entry) => (
+      entry.data.details.number.trim().toLowerCase() === invoice.details.number.trim().toLowerCase()
+      && entry.id !== recordId
+    ));
+    if (duplicate) {
+      notify("That invoice number is already saved. Use a unique number to avoid duplicates.", "error");
+      return;
+    }
+    if (!cloudAvailable) {
+      notify(FIRESTORE_UNAVAILABLE_MESSAGE, "error");
+      return;
+    }
 
     const safePart = (value: string) => value.replace(/[<>:"/\\|?*\x00-\x1f]/g, "_").trim().replace(/\s+/g, "_");
+    const id = recordId ?? newId();
+    const savedInvoice: SavedInvoice = { id, savedAt: new Date().toISOString(), data: invoice };
     setIsGeneratingPdf(true);
+    try {
+      await saveCloudInvoice(savedInvoice);
+      setHistory((current) => [savedInvoice, ...current.filter((entry) => entry.id !== id)]);
+      setRecordId(id);
+    } catch (error) {
+      console.error("Unable to save invoice to Firestore before PDF download.", error);
+      setCloudAvailable(false);
+      setWorkspaceError(FIRESTORE_UNAVAILABLE_MESSAGE);
+      notify("Invoice could not be saved to Firestore, so the PDF was not downloaded.", "error");
+      setIsGeneratingPdf(false);
+      return;
+    }
+
     try {
       const preview = window.document.querySelector<HTMLElement>(".invoice-document");
       if (!preview) {
@@ -497,11 +453,11 @@ export default function InvoiceWorkspace() {
         preview,
         `TechGajana_Invoice_${safePart(invoice.details.number)}_${safePart(invoice.client.name)}.pdf`,
       );
-      notify("Invoice PDF downloaded.");
+      notify("Invoice saved to Firestore and PDF downloaded.");
     } catch (error) {
       console.error("Unable to generate invoice PDF.", error);
       const message = error instanceof Error ? error.message : "Please try again.";
-      notify(`PDF download failed. ${message}`, "error");
+      notify(`Invoice was saved to Firestore, but PDF download failed. ${message}`, "error");
     } finally {
       setIsGeneratingPdf(false);
     }
@@ -514,7 +470,6 @@ export default function InvoiceWorkspace() {
         id: newId(),
         description: "",
         project: "",
-        code: "",
         quantity: 1,
         unit: "Service",
         rate: 0,
@@ -526,87 +481,17 @@ export default function InvoiceWorkspace() {
     }));
   };
 
-  const assetControl = (target: AssetTarget, asset?: StoredAsset, title = "Upload file") => (
-    <div className="asset-control">
-      <input
-        ref={(element) => { fileInputs.current[target] = element; }}
-        type="file"
-        accept={target === "proof" ? "image/png,image/jpeg,image/webp,application/pdf" : "image/png,image/jpeg,image/webp"}
-        onChange={(event) => void handleUpload(target, event)}
-        hidden
-      />
-      {asset ? (
-        <div className="asset-picked">
-          <span className="asset-check"><Icon name="check" size={13} /></span>
-          <span className="asset-name" title={asset.name}>{asset.name}</span>
-          <button type="button" className="icon-button danger-hover" aria-label={`Remove ${asset.name}`} onClick={() => removeAsset(target, asset.id)}>
-            <Icon name="close" size={15} />
-          </button>
-        </div>
-      ) : (
-        <button type="button" className="upload-button" onClick={() => fileInputs.current[target]?.click()}>
-          <span className="upload-icon"><Icon name="add" size={16} /></span>
-          <span><strong>{title}</strong><small>PNG, JPG, WebP{target === "proof" ? ", PDF" : ""}</small></span>
-        </button>
-      )}
-    </div>
-  );
-
-  if (!firebaseConfigured) {
-    return (
-      <main className="auth-page">
-        <section className="auth-panel">
-          <div className="auth-kicker">TECHGAJANA · INVOICE STUDIO</div>
-          <h1>Firebase setup required</h1>
-          <p>Copy <code>.env.example</code> to <code>.env.local</code>, add the Firebase web app settings, then restart the development server.</p>
-        </section>
-      </main>
-    );
-  }
-
-  if (authLoading) {
-    return <main className="auth-page"><section className="auth-panel"><h1>Connecting to Firebase…</h1></section></main>;
-  }
-
-  if (!user) {
-    return (
-      <main className="auth-page">
-        <section className="auth-panel">
-          <div className="auth-kicker">TECHGAJANA · INVOICE STUDIO</div>
-          <h1>Sign in</h1>
-          <p>Use your company workspace account to access shared invoices and clients.</p>
-          <form className="auth-form" onSubmit={(event) => void submitSignIn(event)}>
-            <label className="auth-field">
-              <span>Email</span>
-              <input className="input-control" type="email" autoComplete="username" value={signInEmail} onChange={(event) => setSignInEmail(event.target.value)} required />
-            </label>
-            <label className="auth-field">
-              <span>Password</span>
-              <input className="input-control" type="password" autoComplete="current-password" value={signInPassword} onChange={(event) => setSignInPassword(event.target.value)} required />
-            </label>
-            {signInError && <p className="auth-error" role="alert">{signInError}</p>}
-            <button className="button button-primary auth-submit" type="submit" disabled={signInBusy}>
-              {signInBusy ? "Signing in…" : "Sign in to workspace"}
-            </button>
-          </form>
-          <p className="auth-footnote">Workspace accounts are provisioned by an administrator.</p>
-        </section>
-      </main>
-    );
-  }
-
   if (workspaceLoading) {
     return <main className="auth-page"><section className="auth-panel"><h1>Loading shared workspace…</h1></section></main>;
   }
 
-  if (workspaceError && !hydrated) {
+  if (!hydrated) {
     return (
       <main className="auth-page">
         <section className="auth-panel">
-          <div className="auth-kicker">WORKSPACE UNAVAILABLE</div>
-          <h1>Could not connect</h1>
-          <p>{workspaceError}</p>
-          <button type="button" className="button button-outline" onClick={() => void signOutUser()}>Sign out</button>
+          <h1>Firestore is required</h1>
+          <p>{firebaseConfigured ? workspaceError || FIRESTORE_UNAVAILABLE_MESSAGE : "Firebase is not configured. Add the Firestore Firebase settings before using the invoice workspace."}</p>
+          <button className="button button-primary" onClick={() => window.location.reload()}>Retry connection</button>
         </section>
       </main>
     );
@@ -616,23 +501,23 @@ export default function InvoiceWorkspace() {
     <main className="workspace">
       <header className="topbar">
         <a className="brand-lockup" href="#" aria-label="TechGajana invoice home">
-          <Image
-            src="/techgajana-logo.png"
-            alt="Tech Gajana — A Journey Toward Eleventh Dimension"
-            width={813}
-            height={632}
-            priority
-            className="brand-logo"
-          />
+          <CompanyLogo className="brand-logo-crop" />
           <span className="brand-name">Invoice Studio</span>
         </a>
         <div className="topbar-spacer" />
-        <div className="local-badge"><span /> Shared cloud workspace</div>
-        <span className="cloud-user">{user.email}</span>
-        <button type="button" className="button button-outline" onClick={() => void signOutUser()}>Sign out</button>
+        <div
+          className="local-badge"
+          aria-label={cloudAvailable
+            ? "Public shared workspace. Anyone with the app URL can view, edit, or delete workspace invoices and client details."
+            : workspaceError || FIRESTORE_UNAVAILABLE_MESSAGE}
+          title={cloudAvailable
+            ? "Anyone with the app URL can view, edit, or delete workspace invoices and client details."
+            : workspaceError || FIRESTORE_UNAVAILABLE_MESSAGE}
+          role="status"
+        >
+          <span /> {cloudAvailable ? "Firestore shared workspace" : "Firestore unavailable · saving disabled"}
+        </div>
       </header>
-
-      {workspaceError && <div className="cloud-warning" role="alert">{workspaceError}</div>}
 
       <section className="page-heading">
         <h1>Create invoice</h1>
@@ -684,44 +569,10 @@ export default function InvoiceWorkspace() {
             <h2>Invoice details</h2>
           </div>
 
-          <Section title="Company details">
-            <div className="section-grid">
-              <Field label="Company name" className="span-2">
-                <TextInput value={invoice.company.name} onChange={(event) => updateArea("company", { name: event.target.value })} placeholder="Company name" />
-              </Field>
-              <Field label="Business type">
-                <TextInput value={invoice.company.businessType} onChange={(event) => updateArea("company", { businessType: event.target.value })} placeholder="Software & IT services" />
-              </Field>
-              <Field label="Email">
-                <TextInput type="email" value={invoice.company.email} onChange={(event) => updateArea("company", { email: event.target.value })} placeholder="hello@company.com" />
-              </Field>
-              <Field label="Business address" className="span-2">
-                <TextArea rows={2} value={invoice.company.address} onChange={(event) => updateArea("company", { address: event.target.value })} placeholder="Street, city, state, PIN code" />
-              </Field>
-              <Field label="Phone">
-                <TextInput value={invoice.company.phone} onChange={(event) => updateArea("company", { phone: event.target.value })} placeholder="+91 00000 00000" />
-              </Field>
-              <Field label="Website">
-                <TextInput value={invoice.company.website} onChange={(event) => updateArea("company", { website: event.target.value })} placeholder="www.example.com" />
-              </Field>
-              <Field label="GSTIN (optional)">
-                <TextInput value={invoice.company.gstin} onChange={(event) => updateArea("company", { gstin: event.target.value })} placeholder="GST registration number" />
-              </Field>
-              <Field label="PAN (optional)">
-                <TextInput value={invoice.company.pan} onChange={(event) => updateArea("company", { pan: event.target.value })} placeholder="PAN" />
-              </Field>
-            </div>
-            <div className="upload-row">
-              <div><span className="upload-label">COMPANY LOGO</span>{assetControl("logo", invoice.company.logo, "Add logo")}</div>
-              <div><span className="upload-label">AUTHORIZED SIGNATURE</span>{assetControl("signature", invoice.company.signature, "Add signature")}</div>
-              <div><span className="upload-label">COMPANY STAMP</span>{assetControl("stamp", invoice.company.stamp, "Add stamp")}</div>
-            </div>
-          </Section>
-
           <Section title="Client details" defaultOpen>
             <div className="section-grid">
-              <Field label="Client / company name" className="span-2">
-                <TextInput value={invoice.client.name} onChange={(event) => updateArea("client", { name: event.target.value })} placeholder="Client company name" />
+              <Field label="Client name" className="span-2">
+                <TextInput value={invoice.client.name} onChange={(event) => updateArea("client", { name: event.target.value })} placeholder="Client name" />
               </Field>
               {clients.length > 0 && (
                 <Field label="Saved client" className="span-2">
@@ -734,26 +585,11 @@ export default function InvoiceWorkspace() {
                   </SelectInput>
                 </Field>
               )}
-              <Field label="Contact person">
-                <TextInput value={invoice.client.contact} onChange={(event) => updateArea("client", { contact: event.target.value })} placeholder="Name" />
-              </Field>
-              <Field label="Email">
-                <TextInput type="email" value={invoice.client.email} onChange={(event) => updateArea("client", { email: event.target.value })} placeholder="client@company.com" />
-              </Field>
               <Field label="Billing address" className="span-2">
                 <TextArea rows={2} value={invoice.client.address} onChange={(event) => updateArea("client", { address: event.target.value })} placeholder="Street, city, state, PIN code" />
               </Field>
-              <Field label="Phone">
-                <TextInput value={invoice.client.phone} onChange={(event) => updateArea("client", { phone: event.target.value })} placeholder="+91 00000 00000" />
-              </Field>
               <Field label="GSTIN (optional)">
                 <TextInput value={invoice.client.gstin} onChange={(event) => updateArea("client", { gstin: event.target.value })} placeholder="Client GSTIN" />
-              </Field>
-              <Field label="State">
-                <TextInput value={invoice.client.state} onChange={(event) => updateArea("client", { state: event.target.value })} placeholder="State" />
-              </Field>
-              <Field label="Place of supply">
-                <TextInput value={invoice.client.placeOfSupply} onChange={(event) => updateArea("client", { placeOfSupply: event.target.value })} placeholder="State / territory" />
               </Field>
             </div>
             <button type="button" className="text-button save-client-action" onClick={saveClient}><Icon name="save" size={14} /> Save client for later</button>
@@ -764,35 +600,9 @@ export default function InvoiceWorkspace() {
               <Field label="Invoice number">
                 <TextInput value={invoice.details.number} onChange={(event) => updateArea("details", { number: event.target.value })} />
               </Field>
-              <Field label="Invoice type">
-                <SelectInput value={invoice.details.type} onChange={(event) => updateArea("details", { type: event.target.value as InvoiceData["details"]["type"] })}>
-                  <option>Tax Invoice</option><option>Invoice</option><option>Proforma Invoice</option>
-                </SelectInput>
-              </Field>
               <Field label="Invoice date">
                 <TextInput type="date" value={invoice.details.date} onChange={(event) => updateArea("details", { date: event.target.value })} />
               </Field>
-              <Field label="Due date">
-                <TextInput type="date" value={invoice.details.dueDate} onChange={(event) => updateArea("details", { dueDate: event.target.value })} />
-              </Field>
-              <Field label="Currency">
-                <SelectInput value={invoice.details.currency} onChange={(event) => updateArea("details", { currency: event.target.value })}>
-                  <option value="INR">INR — Indian Rupee (₹)</option>
-                  <option value="USD">USD — US Dollar ($)</option>
-                  <option value="EUR">EUR — Euro (€)</option>
-                  <option value="GBP">GBP — British Pound (£)</option>
-                </SelectInput>
-              </Field>
-              <Field label="Place of supply">
-                <TextInput value={invoice.details.placeOfSupply} onChange={(event) => updateArea("details", { placeOfSupply: event.target.value })} placeholder="Optional" />
-              </Field>
-              <Field label="Purchase order no.">
-                <TextInput value={invoice.details.purchaseOrder} onChange={(event) => updateArea("details", { purchaseOrder: event.target.value })} placeholder="Optional" />
-              </Field>
-              <label className="toggle-field">
-                <span><strong>Reverse charge</strong><small>Applicable to this invoice</small></span>
-                <input type="checkbox" checked={invoice.details.reverseCharge} onChange={(event) => updateArea("details", { reverseCharge: event.target.checked })} />
-              </label>
             </div>
           </Section>
 
@@ -815,9 +625,6 @@ export default function InvoiceWorkspace() {
                     <div className="section-grid item-grid">
                       <Field label="Project name">
                         <TextInput value={item.project} onChange={(event) => updateItem(item.id, { project: event.target.value })} placeholder="Optional" />
-                      </Field>
-                      <Field label="SAC / HSN">
-                        <TextInput value={item.code} onChange={(event) => updateItem(item.id, { code: event.target.value })} placeholder="Optional" />
                       </Field>
                       <Field label="Quantity">
                         <TextInput type="number" min="0" step="0.01" value={item.quantity} onChange={(event) => updateItem(item.id, { quantity: Number(event.target.value) })} />
@@ -882,55 +689,65 @@ export default function InvoiceWorkspace() {
             </div>
           </Section>
 
-          <Section title="Payment & advance">
-            <div className="section-grid">
-              <Field label="Advance amount paid">
-                <TextInput type="number" min="0" step="0.01" value={invoice.payment.advance} onChange={(event) => updateArea("payment", { advance: Number(event.target.value) })} />
-              </Field>
-              <Field label="Payment date">
-                <TextInput type="date" value={invoice.payment.date} onChange={(event) => updateArea("payment", { date: event.target.value })} />
-              </Field>
-              <Field label="Payment method">
-                <SelectInput value={invoice.payment.method} onChange={(event) => updateArea("payment", { method: event.target.value as InvoiceData["payment"]["method"] })}>
-                  <option>UPI</option><option>Bank Transfer</option><option>Cash</option><option>Other</option>
-                </SelectInput>
-              </Field>
-              <Field label="Transaction ID / UTR">
-                <TextInput value={invoice.payment.transactionId} onChange={(event) => updateArea("payment", { transactionId: event.target.value })} placeholder="Optional reference" />
-              </Field>
+          <Section title="Project payments">
+            <div className="payment-entries">
+              {paymentEntries.map((payment, index) => (
+                <div className="payment-entry" key={payment.id}>
+                  <div className="payment-entry-heading">
+                    {index === 0 ? (
+                      <strong>Payment 1 · Advance</strong>
+                    ) : (
+                      <Field label={`Payment ${index + 1} milestone`}>
+                        <TextInput
+                          value={payment.label}
+                          onChange={(event) => updatePayment(payment.id, { label: event.target.value })}
+                          placeholder="e.g. Design approval"
+                        />
+                      </Field>
+                    )}
+                    {index > 0 && (
+                      <button
+                        type="button"
+                        className="icon-button danger-hover"
+                        aria-label={`Remove payment ${index + 1}`}
+                        onClick={() => removePayment(payment.id)}
+                      >
+                        <Icon name="trash" size={14} />
+                      </button>
+                    )}
+                  </div>
+                  <div className="section-grid payment-entry-fields">
+                    <Field label="Amount paid">
+                      <TextInput
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={payment.amount}
+                        onChange={(event) => updatePayment(payment.id, { amount: Number(event.target.value) })}
+                      />
+                    </Field>
+                    <Field label="Payment date">
+                      <TextInput
+                        type="date"
+                        value={payment.date}
+                        onChange={(event) => updatePayment(payment.id, { date: event.target.value })}
+                      />
+                    </Field>
+                  </div>
+                </div>
+              ))}
+              <button type="button" className="text-button add-payment-action" onClick={addPayment}>
+                <Icon name="add" size={14} /> Add project payment
+              </button>
             </div>
             <div className="payment-status-row">
               <span>Payment status</span><span className={`status-pill status-${totals.status.toLowerCase().replace(" ", "-")}`}><span />{totals.status}</span>
             </div>
-            <div className="proof-upload">
-              <span className="upload-label">PAYMENT PROOF{invoice.payment.proofs.length > 0 ? ` · ${invoice.payment.proofs.length}` : ""}</span>
-              <div className="proof-list">
-                {invoice.payment.proofs.map((proof) => (
-                  <div className="proof-file-row" key={proof.id}>
-                    <span className="proof-type"><Icon name="file" size={15} /></span><span className="asset-name">{proof.name}</span>
-                    <button type="button" className="icon-button danger-hover" onClick={() => removeAsset("proof", proof.id)} aria-label={`Remove ${proof.name}`}><Icon name="close" size={14} /></button>
-                  </div>
-                ))}
-                <button type="button" className="upload-button compact-upload" onClick={() => fileInputs.current.proof?.click()}><span className="upload-icon"><Icon name="add" size={15} /></span><span><strong>Add receipt or screenshot</strong><small>PNG, JPG, WebP, PDF</small></span></button>
-                <input ref={(element) => { fileInputs.current.proof = element; }} type="file" accept="image/png,image/jpeg,image/webp,application/pdf" onChange={(event) => void handleUpload("proof", event)} hidden />
-              </div>
-            </div>
           </Section>
 
-          <Section title="Bank details">
-            <div className="section-grid">
-              <Field label="Account holder name"><TextInput value={invoice.bank.accountHolder} onChange={(event) => updateArea("bank", { accountHolder: event.target.value })} placeholder="Account holder" /></Field>
-              <Field label="Bank name"><TextInput value={invoice.bank.bankName} onChange={(event) => updateArea("bank", { bankName: event.target.value })} placeholder="Bank name" /></Field>
-              <Field label="Account number"><TextInput value={invoice.bank.accountNumber} onChange={(event) => updateArea("bank", { accountNumber: event.target.value })} placeholder="Account number" /></Field>
-              <Field label="IFSC code"><TextInput value={invoice.bank.ifsc} onChange={(event) => updateArea("bank", { ifsc: event.target.value })} placeholder="IFSC" /></Field>
-              <Field label="UPI ID"><TextInput value={invoice.bank.upiId} onChange={(event) => updateArea("bank", { upiId: event.target.value })} placeholder="name@bank" /></Field>
-              <Field label="Payment QR code"><div className="qr-upload">{assetControl("qr", invoice.bank.qrCode, "Add QR code")}</div></Field>
-            </div>
-          </Section>
-
-          <Section title={`Terms & conditions (${invoice.terms.length})`}>
+          <Section title={`Terms & conditions (${invoiceTerms.length})`}>
             <div className="terms-editor">
-              {invoice.terms.map((term, index) => (
+              {invoiceTerms.map((term, index) => (
                 <div className="term-row" key={`${index}-${term.slice(0, 15)}`}>
                   <span className="term-number">{String(index + 1).padStart(2, "0")}</span>
                   <TextInput aria-label={`Term ${index + 1}`} value={term} onChange={(event) => setInvoice((current) => ({ ...current, terms: current.terms.map((value, row) => row === index ? event.target.value : value) }))} />
@@ -943,14 +760,7 @@ export default function InvoiceWorkspace() {
             </div>
           </Section>
 
-          <Section title="Signatory details">
-            <div className="section-grid">
-              <Field label="Authorized signatory"><TextInput value={invoice.company.signatory} onChange={(event) => updateArea("company", { signatory: event.target.value })} placeholder="Name" /></Field>
-              <Field label="Designation"><TextInput value={invoice.company.designation} onChange={(event) => updateArea("company", { designation: event.target.value })} placeholder="Director, etc." /></Field>
-            </div>
-          </Section>
-
-          <div className="editor-footer-note"><span className="privacy-lock">⌑</span> Your invoices and uploads stay in this browser. Nothing is sent to a server.</div>
+          <div className="editor-footer-note"><span className="privacy-lock">⌑</span> Company address, CIN, signature, and seal are configured in the code.</div>
         </div>
 
         <div className="preview-column">
@@ -959,7 +769,7 @@ export default function InvoiceWorkspace() {
             <span className="preview-page-label">Updates as you type</span>
           </div>
           <div className="preview-frame">
-            <InvoicePreview invoice={invoice} totals={totals} assetUrls={assetUrls} />
+            <InvoicePreview invoice={invoice} totals={totals} />
           </div>
           <div className="preview-help"><span className="preview-help-icon">i</span><span>Changes appear instantly. <strong>Download PDF</strong> saves a print-ready A4 invoice to your device.</span></div>
         </div>
@@ -981,16 +791,19 @@ function moveItem<T>(items: T[], from: number, to: number): T[] {
 function InvoicePreview({
   invoice,
   totals,
-  assetUrls,
 }: {
   invoice: InvoiceData;
   totals: ReturnType<typeof calculateTotals>;
-  assetUrls: Record<string, string>;
 }) {
   const shownDate = (value: string) => value ? new Date(`${value}T00:00:00`).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "numeric" }) : "—";
-  const asset = (file?: StoredAsset) => file ? assetUrls[file.id] : undefined;
   const fmt = (value: number) => formatCurrency(value, invoice.details.currency);
   const gstEnabled = invoice.gstEnabled !== false;
+  const invoiceTerms = normalizeInvoiceTerms(invoice.terms);
+  const paymentEntries = getPaymentEntries(invoice.payment);
+  const recordedPayments = paymentEntries
+    .map((payment, index) => ({ payment, index }))
+    .filter(({ payment }) => payment.amount > 0);
+  const amountPaid = recordedPayments.reduce((sum, { payment }) => sum + payment.amount, 0);
   const itemAmountTotals = invoice.items.reduce((summary, item) => {
     const amounts = itemAmounts(item, gstEnabled);
     if (item.taxType === "IGST") summary.igst += amounts.tax;
@@ -1007,26 +820,16 @@ function InvoicePreview({
       <div className="paper-top-accent" />
       <header className="paper-header">
         <div className="paper-company">
-          {asset(invoice.company.logo) ? (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img className="paper-logo" src={asset(invoice.company.logo)} alt={`${invoice.company.name} logo`} />
-          ) : (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img className="paper-logo paper-brand-logo" src="/techgajana-logo.png" alt="Tech Gajana logo" />
-          )}
+          <CompanyLogo className="paper-logo-crop" />
           <div className="paper-company-info">
-            <strong>{invoice.company.name || "Company name"}</strong>
-            {invoice.company.businessType && <span>{invoice.company.businessType}</span>}
-            {invoice.company.address && <span>{invoice.company.address}</span>}
-            <span className="paper-contact-line">{[invoice.company.email, invoice.company.phone].filter(Boolean).join("  ·  ")}</span>
-            {invoice.company.website && <span>{invoice.company.website}</span>}
-            {invoice.company.gstin && <span>GSTIN: {invoice.company.gstin}</span>}
-            {invoice.company.pan && <span>PAN: {invoice.company.pan}</span>}
+            <strong>{COMPANY_IDENTITY.name}</strong>
+            {COMPANY_IDENTITY.address && <span>{COMPANY_IDENTITY.address}</span>}
+            {COMPANY_IDENTITY.cin && <span>CIN: {COMPANY_IDENTITY.cin}</span>}
+            {COMPANY_IDENTITY.contact && <span>Contact: {COMPANY_IDENTITY.contact}</span>}
           </div>
         </div>
         <div className="paper-title-block">
-          <span className="paper-type">{invoice.details.type.toUpperCase()}</span>
-          <h2>INVOICE</h2>
+          <h2>{invoice.details.type === "Tax Invoice" ? "INVOICE" : invoice.details.type.toUpperCase()}</h2>
           <span className="paper-invoice-number">#{invoice.details.number || "—"}</span>
         </div>
       </header>
@@ -1034,28 +837,27 @@ function InvoicePreview({
       <div className="paper-rule" />
       <section className="paper-meta-grid">
         <div className="paper-meta-item"><span>INVOICE DATE</span><strong>{shownDate(invoice.details.date)}</strong></div>
-        <div className="paper-meta-item"><span>DUE DATE</span><strong>{shownDate(invoice.details.dueDate)}</strong></div>
         <div className="paper-meta-item"><span>PAYMENT STATUS</span><strong className={`paper-status paper-${totals.status.toLowerCase().replace(" ", "-")}`}>{totals.status}</strong></div>
-        {invoice.details.purchaseOrder && <div className="paper-meta-item"><span>PURCHASE ORDER</span><strong>{invoice.details.purchaseOrder}</strong></div>}
       </section>
 
       <section className="paper-billto">
         <div className="paper-section-label"><span className="paper-section-marker" /> BILL TO</div>
-        <strong className="paper-client-name">{invoice.client.name || "Client / Company name"}</strong>
-        {invoice.client.contact && <span>Attn: {invoice.client.contact}</span>}
-        {invoice.client.address && <span>{invoice.client.address}</span>}
-        {invoice.client.email && <span>{invoice.client.email}</span>}
-        {invoice.client.phone && <span>{invoice.client.phone}</span>}
-        {invoice.client.gstin && <span>GSTIN: {invoice.client.gstin}</span>}
-        {(invoice.client.state || invoice.client.placeOfSupply || invoice.details.placeOfSupply) && (
-          <span>Place of supply: {[invoice.client.placeOfSupply || invoice.details.placeOfSupply, invoice.client.state].filter(Boolean).join(", ")}</span>
-        )}
-        {invoice.details.reverseCharge && <span>Reverse charge applicable</span>}
+        <div className="paper-billto-details">
+          <strong className="paper-client-name">{invoice.client.name || "Client name"}</strong>
+          {invoice.client.address && <span>{invoice.client.address}</span>}
+          {invoice.client.contact && <span>Attn: {invoice.client.contact}</span>}
+          {invoice.client.phone && <span>Phone: {invoice.client.phone}</span>}
+          {invoice.client.email && <span>Email: {invoice.client.email}</span>}
+          {invoice.client.gstin && <span>GSTIN: {invoice.client.gstin}</span>}
+          {(invoice.client.placeOfSupply || invoice.details.placeOfSupply) && (
+            <span>Place of supply: {invoice.client.placeOfSupply || invoice.details.placeOfSupply}</span>
+          )}
+        </div>
       </section>
 
       <div className="paper-table-wrap">
         <table className="paper-items-table">
-          <thead><tr><th className="col-number">#</th><th className="col-description">DESCRIPTION</th><th className="col-code">SAC/HSN</th><th className="col-qty">QTY</th><th className="col-rate">RATE</th>{gstEnabled && <th className="col-tax">GST</th>}<th className="col-amount">AMOUNT</th></tr></thead>
+          <thead><tr><th className="col-number">#</th><th className="col-description">DESCRIPTION</th><th className="col-qty">QTY</th><th className="col-rate">RATE</th>{gstEnabled && <th className="col-tax">GST</th>}<th className="col-amount">AMOUNT</th></tr></thead>
           <tbody>
             {invoice.items.map((item, index) => {
               const amounts = itemAmounts(item, gstEnabled);
@@ -1063,7 +865,6 @@ function InvoicePreview({
                 <tr key={item.id}>
                   <td className="col-number">{String(index + 1).padStart(2, "0")}</td>
                   <td className="col-description"><strong>{item.description || "Service description"}</strong>{item.project && <small>{item.project}</small>}</td>
-                  <td className="col-code">{item.code || "—"}</td>
                   <td className="col-qty">{item.quantity} <span>{item.unit}</span></td>
                   <td className="col-rate">{fmt(item.rate)}</td>
                   {gstEnabled && <td className="col-tax">{item.taxPercent > 0 ? `${item.taxPercent}%` : "—"}</td>}
@@ -1077,24 +878,24 @@ function InvoicePreview({
 
       <div className="paper-bottom-grid">
         <div className="paper-payment">
-          <div className="paper-section-label"><span className="paper-section-marker" /> PAYMENT DETAILS</div>
-          <div className="paper-payment-method"><span className="payment-method-icon">{invoice.payment.method === "UPI" ? "↗" : "₹"}</span><span><strong>{invoice.payment.advance > 0 ? `Advance via ${invoice.payment.method}` : "Payment information"}</strong><small>{invoice.payment.transactionId || "Use bank transfer or UPI"}</small></span></div>
-          {(invoice.bank.accountHolder || invoice.bank.bankName || invoice.bank.accountNumber || invoice.bank.ifsc || invoice.bank.upiId) && (
-            <div className="paper-bank-details">
-              {invoice.bank.accountHolder && <span><small>ACCOUNT NAME</small>{invoice.bank.accountHolder}</span>}
-              {invoice.bank.bankName && <span><small>BANK</small>{invoice.bank.bankName}</span>}
-              {invoice.bank.accountNumber && <span><small>ACCOUNT NO.</small>{invoice.bank.accountNumber}</span>}
-              {invoice.bank.ifsc && <span><small>IFSC</small>{invoice.bank.ifsc}</span>}
-              {invoice.bank.upiId && <span><small>UPI ID</small>{invoice.bank.upiId}</span>}
-            </div>
-          )}
-          {asset(invoice.bank.qrCode) && (
-            // eslint-disable-next-line @next/next/no-img-element
-            <img className="paper-qr" src={asset(invoice.bank.qrCode)} alt="Payment QR code" />
-          )}
-          {invoice.payment.advance > 0 && (
-            <div className="paper-advance-note">Advance of <strong>{fmt(invoice.payment.advance)}</strong> received on {shownDate(invoice.payment.date)}{invoice.payment.transactionId ? ` · Ref ${invoice.payment.transactionId}` : ""}.</div>
-          )}
+          <div className="paper-section-label"><span className="paper-section-marker" /> PAYMENT SUMMARY</div>
+          <div className="paper-payment-content">
+            {recordedPayments.length > 0 ? (
+              <div className="paper-payment-list">
+                {recordedPayments.map(({ payment, index }) => (
+                  <div className="paper-payment-row" key={payment.id}>
+                    <span>{index === 0 ? "Advance" : payment.label || `Payment ${index + 1}`}</span>
+                    <strong>{fmt(payment.amount)}</strong>
+                    <small>{shownDate(payment.date)}</small>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="paper-advance-note">No payments recorded.</div>
+            )}
+            {amountPaid > 0 && <div className="paper-total-row paper-advance-total"><span>Total received</span><strong>{fmt(amountPaid)}</strong></div>}
+            <div className="paper-balance"><span>Remaining balance</span><strong>{fmt(totals.balanceDue)}</strong></div>
+          </div>
         </div>
         <div className="paper-totals">
           <div className="paper-total-row"><span>Line total</span><strong>{fmt(totals.lineTotal)}</strong></div>
@@ -1105,70 +906,29 @@ function InvoicePreview({
           {gstEnabled && itemAmountTotals.sgst > 0 && <div className="paper-total-row"><span>SGST</span><strong>{fmt(itemAmountTotals.sgst)}</strong></div>}
           {invoice.additionalCharges > 0 && <div className="paper-total-row"><span>Additional charges</span><strong>{fmt(invoice.additionalCharges)}</strong></div>}
           {invoice.roundOff !== 0 && <div className="paper-total-row"><span>Round off</span><strong>{invoice.roundOff < 0 ? "− " : ""}{fmt(Math.abs(invoice.roundOff))}</strong></div>}
-          <div className="paper-grand-total"><span>TOTAL DUE</span><strong>{fmt(totals.grandTotal)}</strong></div>
-          {invoice.payment.advance > 0 && <div className="paper-total-row paper-advance-total"><span>Advance paid</span><strong>− {fmt(invoice.payment.advance)}</strong></div>}
-          <div className="paper-balance"><span>Balance due</span><strong>{fmt(totals.balanceDue)}</strong></div>
+          <div className="paper-grand-total"><span>INVOICE TOTAL</span><strong>{fmt(totals.grandTotal)}</strong></div>
         </div>
       </div>
 
       {invoice.terms.length > 0 && (
         <section className="paper-terms">
           <div className="paper-section-label"><span className="paper-section-marker" /> TERMS & CONDITIONS</div>
-          <ol>{invoice.terms.filter((term) => term.trim()).map((term, index) => <li key={`${index}-${term}`}>{term}</li>)}</ol>
+          <ol>{invoiceTerms.filter((term) => term.trim()).map((term, index) => <li key={`${index}-${term}`}>{term}</li>)}</ol>
         </section>
       )}
 
       <footer className="paper-footer">
-        <div className="paper-thank-you"><span>THANK YOU FOR YOUR BUSINESS</span><strong>We appreciate the opportunity to work with you.</strong></div>
         <div className="paper-signature-block">
           <div className="paper-sign-images">
-            {asset(invoice.company.signature) && (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={asset(invoice.company.signature)} alt="Authorized signature" />
-            )}
-            {asset(invoice.company.stamp) && (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={asset(invoice.company.stamp)} alt="Company stamp" />
-            )}
+            {COMPANY_IDENTITY.signatureSrc && <Image src={COMPANY_IDENTITY.signatureSrc} alt="Authorized signature" width={180} height={123} className="paper-signature-image" unoptimized />}
+            {COMPANY_IDENTITY.sealSrc && <Image src={COMPANY_IDENTITY.sealSrc} alt="Company seal" width={70} height={70} />}
           </div>
-          <div className="paper-sign-line" />
-          <strong>{invoice.company.signatory || "Authorized signatory"}</strong>
-          <span>{invoice.company.designation || "For " + (invoice.company.name || "Company")}</span>
+          <strong>Authorized signatory</strong>
+          <span>For {COMPANY_IDENTITY.name}</span>
         </div>
+        <div className="paper-thank-you"><span>THANK YOU FOR YOUR BUSINESS</span><strong>We appreciate the opportunity to work with you.</strong></div>
       </footer>
-      <div className="paper-bottom-rule"><span>{invoice.company.name || "TechGajana Private Limited"}</span><span>{invoice.details.number || "—"}</span></div>
     </article>
-    {invoice.payment.proofs.map((proof, index) => {
-      const proofUrl = asset(proof);
-      return (
-        <article className="receipt-paper" data-pdf-page-index={index + 1} key={proof.id}>
-          <div className="paper-top-accent" />
-          <header className="receipt-page-header">
-            <div>
-              <div className="paper-section-label"><span className="paper-section-marker" /> PAYMENT RECEIPT</div>
-              <h2>{proof.name}</h2>
-            </div>
-            <span className="receipt-invoice-number">Invoice #{invoice.details.number || "—"}</span>
-          </header>
-          <div className="receipt-page-meta">
-            <span><strong>Received from</strong>{invoice.client.name || "Client / Company name"}</span>
-            {invoice.payment.advance > 0 && <span><strong>Amount received</strong>{fmt(invoice.payment.advance)}</span>}
-            {invoice.payment.date && <span><strong>Payment date</strong>{shownDate(invoice.payment.date)}</span>}
-            {invoice.payment.transactionId && <span><strong>Transaction ID</strong>{invoice.payment.transactionId}</span>}
-          </div>
-          <div className="receipt-page-content">
-            {proof.type === "application/pdf" ? (
-              <div className="paper-pdf-attachment"><Icon name="file" size={22} /><span><strong>{proof.name}</strong><small>PDF receipt attachment reference</small></span></div>
-            ) : proofUrl ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img className="receipt-page-image" src={proofUrl} alt={`Payment receipt: ${proof.name}`} />
-            ) : (
-              <div className="paper-pdf-attachment"><Icon name="file" size={22} /><span><strong>{proof.name}</strong><small>Receipt attachment</small></span></div>
-            )}
-          </div>
-        </article>
-      );
-    })}
     </div>
   );
 }

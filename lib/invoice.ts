@@ -3,6 +3,17 @@ export type DiscountType = "percent" | "amount";
 export type InvoiceType = "Tax Invoice" | "Invoice" | "Proforma Invoice";
 export type PaymentMethod = "UPI" | "Bank Transfer" | "Cash" | "Other";
 
+export const COMPANY_IDENTITY = {
+  name: "TechGajana Private Limited",
+  address: "Thiruvaluvar street, Near MGR statue, Villianur, Puducherry - 605110",
+  cin: "U62099PY2026PT009675",
+  contact: "9486361101",
+  signatureSrc: "/techgajana-signature.png",
+  sealSrc: "",
+} as const;
+
+const PAYMENT_SCHEDULE_TERM = "The remaining balance is payable as agreed in the project payment schedule.";
+
 export interface StoredAsset {
   id: string;
   name: string;
@@ -40,7 +51,6 @@ export interface InvoiceItem {
   id: string;
   description: string;
   project: string;
-  code: string;
   quantity: number;
   unit: string;
   rate: number;
@@ -53,7 +63,6 @@ export interface InvoiceItem {
 export interface InvoiceDetails {
   number: string;
   date: string;
-  dueDate: string;
   type: InvoiceType;
   currency: string;
   placeOfSupply: string;
@@ -62,11 +71,19 @@ export interface InvoiceDetails {
 }
 
 export interface PaymentDetails {
+  payments?: PaymentEntry[];
   advance: number;
   date: string;
   method: PaymentMethod;
   transactionId: string;
   proofs: StoredAsset[];
+}
+
+export interface PaymentEntry {
+  id: string;
+  label: string;
+  amount: number;
+  date: string;
 }
 
 export interface BankDetails {
@@ -123,10 +140,10 @@ export function newId(): string {
 export function createDefaultInvoice(invoiceNumber: string, today: string): InvoiceData {
   return {
     company: {
-      name: "TechGajana Private Limited",
+      name: COMPANY_IDENTITY.name,
       businessType: "Software Development & IT Services",
       email: "techgajana@gmail.com",
-      address: "",
+      address: COMPANY_IDENTITY.address,
       phone: "",
       website: "",
       gstin: "",
@@ -147,8 +164,7 @@ export function createDefaultInvoice(invoiceNumber: string, today: string): Invo
     details: {
       number: invoiceNumber,
       date: today,
-      dueDate: today,
-      type: "Tax Invoice",
+      type: "Invoice",
       currency: "INR",
       placeOfSupply: "",
       reverseCharge: false,
@@ -159,7 +175,6 @@ export function createDefaultInvoice(invoiceNumber: string, today: string): Invo
         id: "initial-item",
         description: "Custom Software Development",
         project: "",
-        code: "",
         quantity: 1,
         unit: "Project",
         rate: 0,
@@ -173,6 +188,7 @@ export function createDefaultInvoice(invoiceNumber: string, today: string): Invo
     additionalCharges: 0,
     roundOff: 0,
     payment: {
+      payments: [{ id: "advance-payment", label: "Advance", amount: 0, date: today }],
       advance: 0,
       date: today,
       method: "UPI",
@@ -187,15 +203,19 @@ export function createDefaultInvoice(invoiceNumber: string, today: string): Invo
       upiId: "",
     },
     terms: [
-      "Payment shall be made according to the payment schedule mentioned in this invoice.",
-      "Any advance payment received will be adjusted against the total invoice amount.",
-      "The remaining balance must be paid on or before the due date.",
+      "Payments received will be adjusted against the invoice total.",
+      PAYMENT_SCHEDULE_TERM,
       "Any additional features, modifications, or services outside the agreed scope will be charged separately.",
-      "Project delivery timelines depend on the timely receipt of required content, approvals, and payments from the client.",
-      "Any applicable taxes will be charged as specified in the invoice.",
-      "All payments should be made to the official payment details provided by TechGajana Private Limited.",
     ],
   };
+}
+
+export function normalizeInvoiceTerms(terms: string[]): string[] {
+  return terms.map((term) => (
+    term.trim().replace(/[.!?]+$/, "").toLowerCase() === "the remaining balance must be paid on or before the due date"
+      ? PAYMENT_SCHEDULE_TERM
+      : term
+  ));
 }
 
 export function calculateTotals(invoice: InvoiceData): InvoiceTotals {
@@ -233,10 +253,11 @@ export function calculateTotals(invoice: InvoiceData): InvoiceTotals {
     0,
     taxable + tax + Math.max(0, invoice.additionalCharges) + invoice.roundOff,
   );
-  const balanceDue = Math.max(0, grandTotal - Math.max(0, invoice.payment.advance));
+  const amountPaid = getPaymentEntries(invoice.payment).reduce((sum, payment) => sum + Math.max(0, payment.amount), 0);
+  const balanceDue = Math.max(0, grandTotal - amountPaid);
   const status = grandTotal > 0 && balanceDue === 0
     ? "Paid"
-    : invoice.payment.advance > 0
+    : amountPaid > 0
       ? "Partially Paid"
       : "Unpaid";
 
@@ -252,6 +273,18 @@ export function calculateTotals(invoice: InvoiceData): InvoiceTotals {
     balanceDue: roundCurrency(balanceDue),
     status,
   };
+}
+
+export function getPaymentEntries(payment: PaymentDetails): PaymentEntry[] {
+  if (payment.payments?.length) {
+    return payment.payments;
+  }
+  return [{
+    id: "advance-payment",
+    label: "Advance",
+    amount: payment.advance,
+    date: payment.date,
+  }];
 }
 
 export function itemAmounts(item: InvoiceItem, gstEnabled = true) {
